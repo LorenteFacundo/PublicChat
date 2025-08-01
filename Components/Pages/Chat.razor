@@ -1,0 +1,193 @@
+@page "/chat"
+@rendermode InteractiveServer
+@using Microsoft.AspNetCore.SignalR.Client
+@using Microsoft.AspNetCore.Components.Web
+@using System.Net.Http.Json
+
+@inject NavigationManager Nav
+@inject HttpClient Http
+
+<h3>Chat compartido</h3>
+
+@if (!Connected)
+{
+    <div class="join-box">
+        <input @bind="User" placeholder="Tu nombre" />
+        <button @onclick="ConnectAsync" disabled="@(string.IsNullOrWhiteSpace(User))">Entrar</button>
+    </div>
+}
+else
+{
+    <div class="chat-box">
+        @foreach (var m in Messages)
+        {
+            <div class="msg @(m.User == User ? "mine" : "other")">
+                <div class="meta">@m.Timestamp.LocalDateTime.ToString("HH:mm") — <b>@m.User</b></div>
+                @if (!string.IsNullOrWhiteSpace(m.Text))
+                {
+                    <div>@m.Text</div>
+                }
+                @if (!string.IsNullOrWhiteSpace(m.GifUrl))
+                {
+                    <div class="gif"><img src="@m.GifUrl" loading="lazy" /></div>
+                }
+            </div>
+        }
+    </div>
+
+    <div class="input-row">
+        <input @bind="Current" @bind:event="oninput" @onkeydown="OnKeyDown" placeholder="Escribí un mensaje..." />
+        <button @onclick="SendTextAsync" disabled="@string.IsNullOrWhiteSpace(Current)">Enviar</button>
+        <button @onclick="ToggleGifPicker">GIF</button>
+        <button @onclick="DisconnectAsync">Salir</button>
+    </div>
+
+    @if (ShowGifPicker)
+    {
+        <div class="gif-picker">
+            <div class="row">
+                <input @bind="GifQuery" @bind:event="oninput" @onkeydown="OnGifKeyDown" placeholder="Buscar GIF (ej: hola, gg, wow)..." />
+                <button @onclick="LoadGifsAsync" disabled="@string.IsNullOrWhiteSpace(GifQuery)">Buscar</button>
+                <button class="link" @onclick="()=> ShowGifPicker=false">Cerrar</button>
+            </div>
+            @if (LoadingGifs) { <p>Buscando GIFs…</p> }
+            <div class="grid">
+                @foreach (var g in GifResults)
+                {
+                    <div class="cell" @onclick="@(()=> SendGifAsync(g.url))" title="Enviar este GIF">
+                        <img src="@g.previewUrl" loading="lazy" />
+                    </div>
+                }
+            </div>
+        </div>
+    }
+}
+
+@code {
+    private HubConnection? _hub;
+    private bool Connected;
+    private string User = "";
+    private string Current = "";
+
+    private class Msg {
+        public string User { get; set; } = "";
+        public string Text { get; set; } = "";
+        public string? GifUrl { get; set; }
+        public DateTimeOffset Timestamp { get; set; } = DateTimeOffset.Now;
+    }
+
+    private readonly List<Msg> Messages = new();
+
+    // GIF picker state
+    private bool ShowGifPicker = false;
+    private string GifQuery = "";
+    private bool LoadingGifs = false;
+    private List<(string previewUrl, string url)> GifResults = new();
+
+    protected override async Task OnInitializedAsync()
+    {
+        _hub = new HubConnectionBuilder()
+            .WithUrl(Nav.ToAbsoluteUri("/hubs/chat"))
+            .WithAutomaticReconnect()
+            .Build();
+
+        _hub.On<ChatCompartido.Models.ChatMessage>("ReceiveMessage", (m) =>
+        {
+            Messages.Add(new Msg { User = m.User, Text = m.Text, GifUrl = m.GifUrl, Timestamp = m.Timestamp });
+            InvokeAsync(StateHasChanged);
+        });
+    }
+
+    private async Task ConnectAsync()
+    {
+        if (_hub is null) return;
+        await _hub.StartAsync();
+        Connected = true;
+    }
+
+    private async Task DisconnectAsync()
+    {
+        if (_hub is null) return;
+        await _hub.StopAsync();
+        Connected = false;
+    }
+
+    private async Task SendTextAsync()
+    {
+        if (_hub is null || string.IsNullOrWhiteSpace(User) || string.IsNullOrWhiteSpace(Current)) return;
+        var text = Current.Trim();
+        Current = "";
+        await _hub.SendAsync("SendMessage", User, text, null);
+    }
+
+    private async Task SendGifAsync(string gifUrl)
+    {
+        if (_hub is null || string.IsNullOrWhiteSpace(User)) return;
+        await _hub.SendAsync("SendMessage", User, "", gifUrl);
+        ShowGifPicker = false;
+        GifQuery = "";
+        GifResults.Clear();
+        StateHasChanged();
+    }
+
+    private void ToggleGifPicker() => ShowGifPicker = !ShowGifPicker;
+
+    private async Task LoadGifsAsync()
+    {
+        if (string.IsNullOrWhiteSpace(GifQuery)) return;
+        LoadingGifs = true;
+        GifResults.Clear();
+        try
+        {
+            var url = Nav.ToAbsoluteUri($"/api/gifs?q={Uri.EscapeDataString(GifQuery)}&limit=24");
+            var list = await Http.GetFromJsonAsync<List<GifItem>>(url);
+            if (list is not null)
+                GifResults = list.Select(x => (x.previewUrl, x.url)).ToList();
+        }
+        catch (Exception ex)
+        {
+            Messages.Add(new Msg { User = "sistema", Text = $"Error al buscar GIFs: {ex.Message}" });
+        }
+        finally
+        {
+            LoadingGifs = false;
+            StateHasChanged();
+        }
+    }
+    private async Task OnKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key is "Enter" && !e.ShiftKey)
+            await SendTextAsync();
+    }
+
+    private async Task OnGifKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key is "Enter" && !e.ShiftKey)
+            await LoadGifsAsync();
+    }
+
+    private sealed class GifItem { public string previewUrl { get; set; } = ""; public string url { get; set; } = ""; }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_hub is not null) await _hub.DisposeAsync();
+    }
+}
+
+<style>
+.chat-box { max-height: 60vh; overflow-y: auto; padding: 8px; border: 1px solid #ddd; border-radius: 8px; margin-bottom: 8px; }
+.msg { margin: 8px 0; }
+.msg.mine { text-align: right; }
+.meta { font-size: 12px; opacity: 0.7; margin-bottom: 2px; }
+.gif img { max-width: 320px; border-radius: 8px; }
+.input-row { display: flex; gap: 8px; margin-top: 8px; }
+input { flex: 1; padding: 8px; }
+.join-box { display: flex; gap: 8px; margin-bottom: 12px; }
+.gif-picker { border: 1px solid #ddd; border-radius: 8px; padding: 12px; margin-top: 8px; }
+.gif-picker .row { display: flex; gap: 8px; }
+.gif-picker .row input { flex: 1; padding: 8px; }
+.gif-picker .grid { margin-top: 8px; display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 8px; }
+.gif-picker .cell { background: #f8f8f8; border-radius: 8px; cursor: pointer; display: flex; align-items: center; justify-content: center; overflow: hidden; height: 120px; }
+.gif-picker .cell img { max-width: 100%; max-height: 100%; display: block; }
+button.link { background: transparent; border: none; color: #1f64ff; cursor: pointer; }
+</style>
